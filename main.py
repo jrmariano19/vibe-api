@@ -5,21 +5,65 @@ from pydantic import BaseModel, EmailStr, constr
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
-from typing import Optional, Dict
+from typing import Optional
+import sqlite3
 import time
 from collections import defaultdict
+import os
 
 SECRET_KEY = "vibe-production-secret-change-me-2026"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24h
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# In-memory (trocar por DB depois)
-users_db: Dict[str, dict] = {}
-posts_db = []
-rate_limit: Dict[str, list] = defaultdict(list)
+DB_PATH = os.environ.get("DB_PATH", "vibe.db")
+rate_limit = defaultdict(list)
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            email TEXT UNIQUE,
+            hashed_password TEXT,
+            is_admin INTEGER DEFAULT 0,
+            bio TEXT DEFAULT '',
+            avatar TEXT DEFAULT '',
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            content TEXT,
+            created_at TEXT,
+            likes INTEGER DEFAULT 0,
+            FOREIGN KEY (username) REFERENCES users(username)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER,
+            username TEXT,
+            text TEXT,
+            created_at TEXT,
+            FOREIGN KEY (post_id) REFERENCES posts(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
 
 app = FastAPI(title="Vibe API", version="1.0")
 
@@ -30,14 +74,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    return response
 
 def check_rate_limit(ip: str, limit: int = 10, window: int = 60):
     now = time.time()
@@ -57,6 +93,9 @@ class Token(BaseModel):
 
 class PostCreate(BaseModel):
     content: constr(min_length=1, max_length=500)
+
+class CommentCreate(BaseModel):
+    text: constr(min_length=1, max_length=300)
 
 def verify_password(plain, hashed):
     return pwd_context.verify(plain, hashed)
@@ -79,30 +118,40 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
-        if username is None or username not in users_db:
+        if username is None:
             raise credentials_exception
-        return users_db[username]
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        conn.close()
+        if not user:
+            raise credentials_exception
+        return dict(user)
     except JWTError:
         raise credentials_exception
 
 @app.post("/register")
 async def register(user: UserCreate, request: Request):
     check_rate_limit(request.client.host)
-    if user.username in users_db:
+    conn = get_db()
+    existing = conn.execute("SELECT username FROM users WHERE username = ?", (user.username,)).fetchone()
+    if existing:
+        conn.close()
         raise HTTPException(status_code=400, detail="Username already registered")
-    users_db[user.username] = {
-        "username": user.username,
-        "email": user.email,
-        "hashed_password": get_password_hash(user.password),
-        "is_admin": user.username == "admin",
-    }
+    conn.execute(
+        "INSERT INTO users (username, email, hashed_password, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
+        (user.username, user.email, get_password_hash(user.password), 1 if user.username == "admin" else 0, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
     return {"username": user.username, "email": user.email}
 
 @app.post("/token", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends(), request: Request = None):
     if request:
         check_rate_limit(request.client.host, limit=5)
-    user = users_db.get(form_data.username)
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE username = ?", (form_data.username,)).fetchone()
+    conn.close()
     if not user or not verify_password(form_data.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     access_token = create_access_token(
@@ -116,28 +165,63 @@ async def read_users_me(current_user: dict = Depends(get_current_user)):
     return {
         "username": current_user["username"],
         "email": current_user["email"],
-        "is_admin": current_user.get("is_admin", False)
+        "is_admin": bool(current_user["is_admin"]),
+        "bio": current_user["bio"],
+        "avatar": current_user["avatar"]
     }
 
 @app.post("/posts")
 async def create_post(post: PostCreate, current_user: dict = Depends(get_current_user)):
-    new_post = {
-        "id": len(posts_db) + 1,
-        "username": current_user["username"],
-        "content": post.content,
-        "created_at": datetime.utcnow().isoformat(),
-        "likes": 0
-    }
-    posts_db.append(new_post)
-    return new_post
+    conn = get_db()
+    cur = conn.execute(
+        "INSERT INTO posts (username, content, created_at) VALUES (?, ?, ?)",
+        (current_user["username"], post.content, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    post_id = cur.lastrowid
+    conn.close()
+    return {"id": post_id, "username": current_user["username"], "content": post.content}
 
 @app.get("/posts")
 async def get_posts(current_user: dict = Depends(get_current_user)):
-    return posts_db[::-1]
+    conn = get_db()
+    posts = conn.execute("SELECT * FROM posts ORDER BY id DESC").fetchall()
+    result = []
+    for p in posts:
+        comments = conn.execute("SELECT username, text FROM comments WHERE post_id = ? ORDER BY id", (p["id"],)).fetchall()
+        result.append({
+            "id": p["id"],
+            "username": p["username"],
+            "content": p["content"],
+            "created_at": p["created_at"],
+            "likes": p["likes"],
+            "comments": [dict(c) for c in comments]
+        })
+    conn.close()
+    return result
+
+@app.post("/posts/{post_id}/like")
+async def like_post(post_id: int, current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    conn.execute("UPDATE posts SET likes = likes + 1 WHERE id = ?", (post_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.post("/posts/{post_id}/comments")
+async def add_comment(post_id: int, comment: CommentCreate, current_user: dict = Depends(get_current_user)):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO comments (post_id, username, text, created_at) VALUES (?, ?, ?, ?)",
+        (post_id, current_user["username"], comment.text, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 @app.get("/")
 async def root():
-    return {"status": "Vibe API online", "docs": "/docs"}
+    return {"status": "Vibe API online (SQLite)", "docs": "/docs"}
 
 if __name__ == "__main__":
     import uvicorn
